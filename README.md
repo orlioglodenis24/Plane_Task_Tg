@@ -16,7 +16,7 @@ Settings → Secrets and variables → Actions:
 **Variables**
 - `PLANE_URL` — адрес вашего Plane, например `https://plane.example.com`
 - `PLANE_WORKSPACE` — slug воркспейса (часть адреса после домена)
-- `TARGET_STATES` — необязательно; названия статусов через запятую, по умолчанию `In Progress,В работе`
+- `TARGET_STATES` — необязательно; названия статусов через запятую, по умолчанию `In Progress,В работе`; `*` — любая смена статуса
 
 Первый запуск: Actions → «Plane → Telegram» → Run workflow. Придёт сообщение «подключён»,
 а в логе запуска — список статусов в проектах (пригодится, если «В работе» у вас называется иначе).

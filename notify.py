@@ -11,7 +11,8 @@
   PLANE_API_KEY    личный API-ключ Plane (Profile → Settings → API tokens)
   TG_BOT_TOKEN     токен бота от @BotFather
   TG_CHAT_ID       куда слать (ваш Telegram id)
-  TARGET_STATES    названия статусов через запятую (по умолчанию «In Progress,В работе»)
+  TARGET_STATES    названия статусов через запятую (по умолчанию «In Progress,В работе»);
+                   * — любая смена статуса
   STATE_FILE       файл с запомненными статусами (по умолчанию state/state.json)
   PREVIEW          true — дополнительно прислать пример уведомления по последней обновлённой задаче
 """
@@ -376,7 +377,7 @@ def main():
             current[issue["id"]] = {"state": state_id, "project": pid}
             mine.append((issue, project, states))
             state = states.get(state_id) or {}
-            if state.get("name", "").strip().lower() not in TARGET_STATES:
+            if "*" not in TARGET_STATES and state.get("name", "").strip().lower() not in TARGET_STATES:
                 continue
             was = prev.get(issue["id"], {}).get("state")
             if was != state_id and not first_run:
@@ -397,7 +398,8 @@ def main():
     if first_run:
         send_telegram(
             f"✅ Plane → Telegram подключён. Слежу за задачами на вас: {len(current)}.\n"
-            f"Уведомляю о статусах: {html.escape(', '.join(sorted(TARGET_STATES)))}"
+            + ("Уведомляю о любой смене статуса" if "*" in TARGET_STATES
+               else f"Уведомляю о статусах: {html.escape(', '.join(sorted(TARGET_STATES)))}")
         )
         print("статусы в проектах:", ", ".join(sorted(found_state_names)))
 
