@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Plane → Telegram: сообщает, когда задача, назначенная на меня, переходит в статус «В работе».
+"""Plane → Telegram: сообщает об изменениях в задачах, назначенных на меня.
 
-Запускается по расписанию (GitHub Actions). Между запусками помнит статусы задач
-в STATE_FILE и шлёт сообщение только при смене статуса на целевой.
+Запускается по расписанию (GitHub Actions). Между запусками помнит снимок каждой задачи
+в STATE_FILE и шлёт сообщение, если изменились статус, приоритет, сроки, исполнители,
+метки, название или описание, появились чужие комментарии или на меня назначили задачу.
 Заодно отвечает на команды боту (/mytask), пришедшие с прошлого запуска.
 
 Переменные окружения:
@@ -11,12 +12,14 @@
   PLANE_API_KEY    личный API-ключ Plane (Profile → Settings → API tokens)
   TG_BOT_TOKEN     токен бота от @BotFather
   TG_CHAT_ID       куда слать (ваш Telegram id)
-  TARGET_STATES    названия статусов через запятую (по умолчанию «In Progress,В работе»);
-                   * — любая смена статуса
-  STATE_FILE       файл с запомненными статусами (по умолчанию state/state.json)
+  TARGET_STATES    статусы, при переходе в которые присылать полную карточку задачи
+                   (через запятую, * — любой; по умолчанию «In Progress,В работе»).
+                   Остальные изменения приходят коротким сообщением.
+  STATE_FILE       файл со снимками задач (по умолчанию state/state.json)
   PREVIEW          true — дополнительно прислать пример уведомления по последней обновлённой задаче
 """
 import datetime
+import hashlib
 import html
 import json
 import os
@@ -41,6 +44,8 @@ TARGET_STATES = {
 STATE_FILE = os.environ.get("STATE_FILE", "state/state.json")
 PREVIEW = os.environ.get("PREVIEW", "").lower() == "true"
 DESCRIPTION_LIMIT = 700
+COMMENT_LIMIT = 300
+COMMENTS_SHOWN = 3
 PRIORITIES = {"urgent": "🔴 Срочный", "high": "🟠 Высокий", "medium": "🟡 Средний", "low": "🔵 Низкий"}
 PRIORITY_ORDER = ["urgent", "high", "medium", "low"]
 STATE_GROUP_ORDER = ["started", "unstarted", "backlog", "completed", "cancelled"]
@@ -49,8 +54,8 @@ BOT_COMMANDS = [{"command": "mytask", "description": "Мои задачи по �
 HELP_TEXT = (
     "/mytask — мои активные задачи по статусам\n"
     "/mytask all — вместе с Done и Cancelled\n\n"
-    "Уведомления о переходе задач в работу приходят сами. "
-    "Бот проверяет Plane раз в 5–15 минут, поэтому отвечает не сразу."
+    "Уведомления об изменениях в ваших задачах приходят сами. "
+    "Бот проверяет Plane раз в 10 минут, поэтому отвечает не сразу."
 )
 TG_LIMIT = 4000
 
@@ -187,30 +192,42 @@ def person_name(user_id):
     return _people.get(user_id, "")
 
 
-def label_names(issue, project_id):
+def label_ids(issue):
+    return {l["id"] if isinstance(l, dict) else l for l in issue.get("labels") or []}
+
+
+def label_name(project_id, label_id):
     if project_id not in _labels:
         _labels[project_id] = {
             l["id"]: l.get("name", "")
             for l in optional_list(f"workspaces/{WORKSPACE}/projects/{project_id}/labels/")
         }
-    names = [l.get("name", "") if isinstance(l, dict) else _labels[project_id].get(l, "")
+    return _labels[project_id].get(label_id, "")
+
+
+def label_names(issue, project_id):
+    names = [l.get("name", "") if isinstance(l, dict) else label_name(project_id, l)
              for l in issue.get("labels") or []]
     return [n for n in names if n]
 
 
-def state_changed_by(issue, project_id):
-    """Кто последним менял статус задачи (по истории задачи)."""
+def user_id(value):
+    return value["id"] if isinstance(value, dict) else value
+
+
+def last_actor(issue, project_id, fields):
+    """Кто последним менял эти поля задачи (по истории задачи)."""
     try:
         activities = plane_list(
             f"workspaces/{WORKSPACE}/projects/{project_id}/issues/{issue['id']}/activities/")
     except Exception:
         return ""
-    changes = [a for a in activities if a.get("field") == "state"]
+    changes = [a for a in activities if a.get("field") in fields]
     if not changes:
         return ""
     last = max(changes, key=lambda a: a.get("created_at") or "")
     actor = last.get("actor_detail") or {}
-    return person_name(last.get("actor") or actor.get("id")) or actor.get("display_name", "")
+    return person_name(user_id(last.get("actor")) or actor.get("id")) or actor.get("display_name", "")
 
 
 def fmt_date(value):
@@ -220,23 +237,30 @@ def fmt_date(value):
         return ""
 
 
-def description_text(issue):
-    text = issue.get("description_stripped") or ""
+def clean_text(stripped, raw_html, limit):
+    text = stripped or ""
     if not text:
-        raw = issue.get("description_html") or ""
-        raw = re.sub(r"(?i)<br\s*/?>|</(p|li|h\d|div)>", "\n", raw)
+        raw = re.sub(r"(?i)<br\s*/?>|</(p|li|h\d|div)>", "\n", raw_html or "")
         text = html.unescape(re.sub(r"<[^>]+>", "", raw))
     text = re.sub(r"\n\s*\n+", "\n", re.sub(r"[ \t]+", " ", text)).strip()
-    if len(text) > DESCRIPTION_LIMIT:
-        text = text[:DESCRIPTION_LIMIT].rsplit(" ", 1)[0] + "…"
+    if limit and len(text) > limit:
+        text = text[:limit].rsplit(" ", 1)[0] + "…"
     return text
 
 
-def issue_message(issue, project, states, was, title=""):
+def description_text(issue, limit=DESCRIPTION_LIMIT):
+    return clean_text(issue.get("description_stripped"), issue.get("description_html"), limit)
+
+
+def issue_link(issue, project):
+    key = f"{project.get('identifier', '')}-{issue.get('sequence_id', '')}"
+    return key, f"{PLANE_URL}/{WORKSPACE}/projects/{project['id']}/issues/{issue['id']}"
+
+
+def issue_message(issue, project, states, was, title="", extra=()):
     e = html.escape
     pid = project["id"]
-    key = f"{project.get('identifier', '')}-{issue.get('sequence_id', '')}"
-    link = f"{PLANE_URL}/{WORKSPACE}/projects/{pid}/issues/{issue['id']}"
+    key, link = issue_link(issue, project)
     state_name = (states.get(issue.get("state")) or {}).get("name", "")
     old_name = (states.get(was) or {}).get("name", "") if was else ""
 
@@ -246,9 +270,9 @@ def issue_message(issue, project, states, was, title=""):
     lines.append(f"📁 Проект: {e(project.get('name', ''))}")
     if old_name and old_name != state_name:
         lines.append(f"🔄 Статус: {e(old_name)} → {e(state_name)}")
-    who = state_changed_by(issue, pid)
-    if who:
-        lines.append(f"👤 Перевёл: {e(who)}")
+        who = last_actor(issue, pid, {"state"})
+        if who:
+            lines.append(f"👤 Перевёл: {e(who)}")
     if PRIORITIES.get(issue.get("priority")):
         lines.append(f"⚡️ Приоритет: {PRIORITIES[issue['priority']]}")
     start, due = fmt_date(issue.get("start_date")), fmt_date(issue.get("target_date"))
@@ -259,16 +283,129 @@ def issue_message(issue, project, states, was, title=""):
     labels = label_names(issue, pid)
     if labels:
         lines.append(f"🏷 Метки: {e(', '.join(labels))}")
-    assignees = [n for n in (person_name(a["id"] if isinstance(a, dict) else a)
-                              for a in issue.get("assignees") or []) if n]
+    assignees = [n for n in (person_name(user_id(a)) for a in issue.get("assignees") or []) if n]
     if assignees:
         lines.append(f"👥 Исполнители: {e(', '.join(assignees))}")
     author = person_name(issue.get("created_by"))
     if author:
         lines.append(f"✍️ Автор: {e(author)}")
+    if extra:
+        lines += ["", *extra]
     description = description_text(issue)
     if description:
         lines += ["", f"📝 {e(description)}"]
+    lines += ["", f"🔗 <a href=\"{e(link)}\">Открыть в Plane</a>"]
+    return "\n".join(lines)
+
+
+def snapshot(issue, project_id, comment_at):
+    """То, что сравниваем между запусками. description — хэш, чтобы не хранить текст."""
+    return {
+        "project": project_id,
+        "state": issue.get("state"),
+        "priority": issue.get("priority") or "none",
+        "start_date": str(issue.get("start_date") or "")[:10],
+        "target_date": str(issue.get("target_date") or "")[:10],
+        "assignees": sorted(assignee_ids(issue)),
+        "labels": sorted(label_ids(issue)),
+        "name": issue.get("name", ""),
+        "description": hashlib.md5(description_text(issue, None).encode()).hexdigest(),
+        "comment_at": comment_at,
+    }
+
+
+def new_comments(issue, project_id, since, me):
+    """Чужие комментарии новее since и время последнего комментария. None — API недоступен."""
+    try:
+        comments = plane_list(
+            f"workspaces/{WORKSPACE}/projects/{project_id}/issues/{issue['id']}/comments/")
+    except urllib.error.HTTPError:
+        return None
+    latest = max((c.get("created_at") or "" for c in comments), default="")
+    if since is None:  # первый раз видим задачу — запоминаем, но не шлём старые комментарии
+        return [], latest
+    fresh = [c for c in comments
+             if (c.get("created_at") or "") > since and user_id(c.get("actor")) != me]
+    return sorted(fresh, key=lambda c: c.get("created_at") or ""), latest
+
+
+def issue_changes(old, new, states, project_id):
+    """Что изменилось: [(поле, строка для сообщения)]. Поля, которых нет в старом снимке, не сравниваем."""
+    e = html.escape
+
+    def changed(field):
+        return field in old and old[field] != new[field]
+
+    def state_name(state_id):
+        return (states.get(state_id) or {}).get("name", "—")
+
+    def diff_names(field, name_of):
+        added = [name_of(x) or "?" for x in new[field] if x not in old[field]]
+        removed = [name_of(x) or "?" for x in old[field] if x not in new[field]]
+        return ", ".join([f"+{n}" for n in added] + [f"−{n}" for n in removed])
+
+    out = []
+    if changed("state"):
+        out.append(("state", f"🔄 Статус: {e(state_name(old['state']))} → {e(state_name(new['state']))}"))
+    if changed("priority"):
+        names = {**PRIORITIES, "none": "⚪️ Без приоритета"}
+        out.append(("priority", f"⚡️ Приоритет: {names.get(old['priority'], old['priority'])} → "
+                                f"{names.get(new['priority'], new['priority'])}"))
+    if changed("target_date"):
+        out.append(("target_date", f"📅 Срок: {fmt_date(old['target_date']) or '—'} → "
+                                   f"{fmt_date(new['target_date']) or '—'}"))
+    if changed("start_date"):
+        out.append(("start_date", f"📅 Начало: {fmt_date(old['start_date']) or '—'} → "
+                                  f"{fmt_date(new['start_date']) or '—'}"))
+    if changed("assignees"):
+        out.append(("assignees", f"👥 Исполнители: {e(diff_names('assignees', person_name))}"))
+    if changed("labels"):
+        out.append(("labels", f"🏷 Метки: {e(diff_names('labels', lambda l: label_name(project_id, l)))}"))
+    if changed("name"):
+        out.append(("name", f"✏️ Название: «{e(old['name'])}» → «{e(new['name'])}»"))
+    if changed("description"):
+        out.append(("description", "📝 Описание изменено"))
+    return out
+
+
+def comment_lines(comments):
+    e = html.escape
+    lines = []
+    for c in comments[:COMMENTS_SHOWN]:
+        name = person_name(user_id(c.get("actor"))) or (c.get("actor_detail") or {}).get("display_name", "")
+        text = clean_text(c.get("comment_stripped"), c.get("comment_html"), COMMENT_LIMIT)
+        lines.append(f"💬 <b>{e(name or 'Комментарий')}</b>: {e(text)}")
+    if len(comments) > COMMENTS_SHOWN:
+        lines.append(f"💬 …и ещё {len(comments) - COMMENTS_SHOWN}")
+    return lines
+
+
+def update_message(issue, project, states, old, changes, comments):
+    if old is None:
+        return issue_message(issue, project, states, None, "📌 <b>На вас назначена задача</b>")
+    fields = {f for f, _ in changes}
+    state_name = (states.get(issue.get("state")) or {}).get("name", "")
+    if "state" in fields and ("*" in TARGET_STATES or state_name.strip().lower() in TARGET_STATES):
+        extra = [line for f, line in changes if f != "state"] + comment_lines(comments)
+        return issue_message(issue, project, states, old["state"], extra=extra)
+
+    e = html.escape
+    key, link = issue_link(issue, project)
+    lines = [f"✏️ <b>Обновление</b> · <a href=\"{e(link)}\">{e(key)}</a>",
+             f"<b>{e(issue.get('name', ''))}</b>", "",
+             f"📁 Проект: {e(project.get('name', ''))}",
+             f"🛠 Статус: {e(state_name)}"]
+    if fields:
+        who = last_actor(issue, project["id"], fields)
+        if who:
+            lines.append(f"👤 Изменил: {e(who)}")
+        lines += ["", "<b>Что изменилось:</b>", *(line for _, line in changes)]
+        if "description" in fields:
+            description = description_text(issue, COMMENT_LIMIT)
+            if description:
+                lines.append(f"<i>{e(description)}</i>")
+    if comments:
+        lines += ["", *comment_lines(comments)]
     lines += ["", f"🔗 <a href=\"{e(link)}\">Открыть в Plane</a>"]
     return "\n".join(lines)
 
@@ -345,12 +482,12 @@ def answer_commands(state, mine):
 
 def main():
     me = my_user_id()
-    old = load_state()
-    first_run = old is None
-    prev = (old or {}).get("issues", {})
+    old_state = load_state()
+    first_run = old_state is None
+    prev = (old_state or {}).get("issues", {})
     current = {}
     found_state_names = set()
-    to_notify = []
+    events = []
     mine = []
     failed_projects = 0
 
@@ -373,33 +510,39 @@ def main():
         for issue in issues:
             if me not in assignee_ids(issue):
                 continue
-            state_id = issue.get("state")
-            current[issue["id"]] = {"state": state_id, "project": pid}
+            old = prev.get(issue["id"])
+            since = (old or {}).get("comment_at")
+            fresh = []
+            # Комментарии закрытых задач не запрашиваем — экономим лимит API Plane.
+            if (states.get(issue.get("state")) or {}).get("group") not in CLOSED_GROUPS:
+                found = new_comments(issue, pid, since, me)
+                if found is not None:
+                    fresh, since = found
+            current[issue["id"]] = snapshot(issue, pid, since)
             mine.append((issue, project, states))
-            state = states.get(state_id) or {}
-            if "*" not in TARGET_STATES and state.get("name", "").strip().lower() not in TARGET_STATES:
+            if first_run:
                 continue
-            was = prev.get(issue["id"], {}).get("state")
-            if was != state_id and not first_run:
-                to_notify.append((issue, project, states, was))
+            changes = issue_changes(old, current[issue["id"]], states, pid) if old else []
+            if old is None or changes or fresh:
+                events.append((issue, project, states, old, changes, fresh))
 
     failed_sends = 0
-    for issue, project, states, was in to_notify:
+    for issue, project, states, old, changes, fresh in events:
         try:
-            send_telegram(issue_message(issue, project, states, was))
-        except Exception as e:  # не запоминаем новый статус — попробуем в следующий раз
+            send_long(update_message(issue, project, states, old, changes, fresh))
+        except Exception as e:  # не запоминаем изменения — попробуем в следующий раз
             print(f"не удалось отправить в Telegram: {type(e).__name__}")
             failed_sends += 1
-            if was is None:
+            if old is None:
                 current.pop(issue["id"], None)
             else:
-                current[issue["id"]]["state"] = was
+                current[issue["id"]] = old
 
     if first_run:
         send_telegram(
             f"✅ Plane → Telegram подключён. Слежу за задачами на вас: {len(current)}.\n"
-            + ("Уведомляю о любой смене статуса" if "*" in TARGET_STATES
-               else f"Уведомляю о статусах: {html.escape(', '.join(sorted(TARGET_STATES)))}")
+            "Пришлю сообщение, если изменится статус, приоритет, сроки, исполнители, метки, "
+            "название или описание, появится комментарий или на вас назначат задачу."
         )
         print("статусы в проектах:", ", ".join(sorted(found_state_names)))
 
@@ -407,11 +550,11 @@ def main():
         issue, project, states = max(mine, key=lambda m: m[0].get("updated_at") or "")
         send_telegram(issue_message(issue, project, states, None, "👀 <i>Пример уведомления</i>"))
 
-    new_state = {**(old or {}), "user_id": me, "issues": current}
+    new_state = {**(old_state or {}), "user_id": me, "issues": current}
     answered = answer_commands(new_state, mine)
     save_state(new_state)
     # В лог — только счётчики: логи Actions могут быть видны всем, у кого есть доступ к репозиторию.
-    print(f"задач на мне: {len(current)}, уведомлений: {len(to_notify) - failed_sends}, "
+    print(f"задач на мне: {len(current)}, уведомлений: {len(events) - failed_sends}, "
           f"ошибок отправки: {failed_sends}, пропущено проектов: {failed_projects}, "
           f"команд: {answered}")
     if failed_sends:
