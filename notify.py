@@ -3,6 +3,7 @@
 
 Запускается по расписанию (GitHub Actions). Между запусками помнит статусы задач
 в STATE_FILE и шлёт сообщение только при смене статуса на целевой.
+Заодно отвечает на команды боту (/mytask), пришедшие с прошлого запуска.
 
 Переменные окружения:
   PLANE_URL        адрес Plane, например https://plane.example.com
@@ -40,6 +41,17 @@ STATE_FILE = os.environ.get("STATE_FILE", "state/state.json")
 PREVIEW = os.environ.get("PREVIEW", "").lower() == "true"
 DESCRIPTION_LIMIT = 700
 PRIORITIES = {"urgent": "🔴 Срочный", "high": "🟠 Высокий", "medium": "🟡 Средний", "low": "🔵 Низкий"}
+PRIORITY_ORDER = ["urgent", "high", "medium", "low"]
+STATE_GROUP_ORDER = ["started", "unstarted", "backlog", "completed", "cancelled"]
+CLOSED_GROUPS = {"completed", "cancelled"}
+BOT_COMMANDS = [{"command": "mytask", "description": "Мои задачи по статусам"}]
+HELP_TEXT = (
+    "/mytask — мои активные задачи по статусам\n"
+    "/mytask all — вместе с Done и Cancelled\n\n"
+    "Уведомления о переходе задач в работу приходят сами. "
+    "Бот проверяет Plane раз в 5–15 минут, поэтому отвечает не сразу."
+)
+TG_LIMIT = 4000
 
 
 def http_json(method, url, headers=None, body=None):
@@ -95,17 +107,42 @@ def my_user_id():
     return plane_get("users/me/")["id"]
 
 
+def tg_call(method, **body):
+    return http_json("POST", f"{TG_API}/bot{TG_TOKEN}/{method}", body=body)
+
+
 def send_telegram(text):
-    http_json(
-        "POST",
-        f"{TG_API}/bot{TG_TOKEN}/sendMessage",
-        body={
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-    )
+    tg_call("sendMessage", chat_id=TG_CHAT_ID, text=text, parse_mode="HTML",
+            disable_web_page_preview=True)
+
+
+def send_long(text):
+    """Отправить текст несколькими сообщениями, если он не влезает в лимит Telegram."""
+    chunk = ""
+    for line in text.split("\n"):
+        if chunk and len(chunk) + len(line) + 1 > TG_LIMIT:
+            send_telegram(chunk)
+            chunk = ""
+        chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        send_telegram(chunk)
+
+
+def pending_commands(offset):
+    """Команды, которые я написал боту с прошлого запуска: ([(команда, аргументы)], новый offset)."""
+    params = {"timeout": 0, "allowed_updates": ["message"]}
+    if offset:
+        params["offset"] = offset
+    commands = []
+    for update in tg_call("getUpdates", **params).get("result", []):
+        offset = max(offset or 0, update["update_id"] + 1)
+        msg = update.get("message") or {}
+        if str((msg.get("chat") or {}).get("id")) != str(TG_CHAT_ID):
+            continue  # бота может найти кто угодно — отвечаем только владельцу
+        words = (msg.get("text") or "").split()
+        if words and words[0].startswith("/"):
+            commands.append((words[0].split("@")[0].lower(), [w.lower() for w in words[1:]]))
+    return commands, offset
 
 
 def load_state():
@@ -235,6 +272,76 @@ def issue_message(issue, project, states, was, title=""):
     return "\n".join(lines)
 
 
+def tasks_message(mine, show_all):
+    e = html.escape
+    today = datetime.date.today().isoformat()
+    groups = {}
+    for issue, project, states in mine:
+        state = states.get(issue.get("state")) or {}
+        groups.setdefault((state.get("group", ""), state.get("name", "Без статуса")), []).append(
+            (issue, project))
+
+    def group_rank(item):
+        (group, name), _ = item
+        rank = STATE_GROUP_ORDER.index(group) if group in STATE_GROUP_ORDER else 1
+        return rank, name.lower()
+
+    def issue_rank(item):
+        issue = item[0]
+        p = issue.get("priority")
+        return (PRIORITY_ORDER.index(p) if p in PRIORITY_ORDER else len(PRIORITY_ORDER),
+                issue.get("target_date") or "9999")
+
+    active = sum(len(v) for (g, _), v in groups.items() if g not in CLOSED_GROUPS)
+    lines = [f"📋 <b>Мои задачи</b> — активных: {active}"]
+    hidden = []
+    for (group, name), items in sorted(groups.items(), key=group_rank):
+        if group in CLOSED_GROUPS and not show_all:
+            hidden.append(f"{name}: {len(items)}")
+            continue
+        lines += ["", f"<b>{e(name)}</b> ({len(items)})"]
+        for issue, project in sorted(items, key=issue_rank):
+            key = f"{project.get('identifier', '')}-{issue.get('sequence_id', '')}"
+            link = f"{PLANE_URL}/{WORKSPACE}/projects/{project['id']}/issues/{issue['id']}"
+            title = issue.get("name", "")
+            if len(title) > 80:
+                title = title[:80].rsplit(" ", 1)[0] + "…"
+            icon = PRIORITIES.get(issue.get("priority"), "⚪️").split()[0]
+            line = f"{icon} <a href=\"{e(link)}\">{e(key)}</a> {e(title)}"
+            due = fmt_date(issue.get("target_date"))
+            if due:
+                overdue = group not in CLOSED_GROUPS and str(issue["target_date"])[:10] < today
+                line += f" · до {due}" + (" ⚠️" if overdue else "")
+            lines.append(line)
+    if not mine:
+        lines.append("\nНа вас нет задач.")
+    if hidden:
+        lines += ["", f"Скрыто: {e(', '.join(hidden))}. Показать все: /mytask all"]
+    return "\n".join(lines)
+
+
+def answer_commands(state, mine):
+    """Ответить на команды боту. Возвращает число отвеченных команд."""
+    if state.get("bot_commands") != BOT_COMMANDS:
+        try:
+            tg_call("setMyCommands", commands=BOT_COMMANDS)
+            state["bot_commands"] = BOT_COMMANDS
+        except Exception as e:
+            print(f"не удалось задать меню команд: {type(e).__name__}")
+    try:
+        commands, offset = pending_commands(state.get("tg_offset"))
+        for command, args in commands:
+            if command == "/mytask":
+                send_long(tasks_message(mine, "all" in args))
+            else:
+                send_telegram(HELP_TEXT)
+    except Exception as e:  # offset не сдвигаем — ответим в следующий раз
+        print(f"не удалось ответить на команды: {type(e).__name__}")
+        return 0
+    state["tg_offset"] = offset
+    return len(commands)
+
+
 def main():
     me = my_user_id()
     old = load_state()
@@ -298,10 +405,13 @@ def main():
         issue, project, states = max(mine, key=lambda m: m[0].get("updated_at") or "")
         send_telegram(issue_message(issue, project, states, None, "👀 <i>Пример уведомления</i>"))
 
-    save_state({"user_id": me, "issues": current})
+    new_state = {**(old or {}), "user_id": me, "issues": current}
+    answered = answer_commands(new_state, mine)
+    save_state(new_state)
     # В лог — только счётчики: логи Actions могут быть видны всем, у кого есть доступ к репозиторию.
     print(f"задач на мне: {len(current)}, уведомлений: {len(to_notify) - failed_sends}, "
-          f"ошибок отправки: {failed_sends}, пропущено проектов: {failed_projects}")
+          f"ошибок отправки: {failed_sends}, пропущено проектов: {failed_projects}, "
+          f"команд: {answered}")
     if failed_sends:
         sys.exit(1)
 
