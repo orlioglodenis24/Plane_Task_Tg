@@ -19,7 +19,7 @@ class handler(BaseHTTPRequestHandler):
         if command:
             name, args = command
             try:
-                notify.answer_command(name, args, notify.my_tasks() if name == "/mytask" else [])
+                notify.answer_command(name, args)
             except Exception as e:
                 # Отвечаем Telegram 200 в любом случае, иначе он будет повторять это сообщение.
                 print(f"не удалось ответить на {name}: {type(e).__name__}")

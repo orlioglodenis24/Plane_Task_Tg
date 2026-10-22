@@ -62,14 +62,19 @@ PRIORITIES = {"urgent": "🔴 Срочный", "high": "🟠 Высокий", "m
 PRIORITY_ORDER = ["urgent", "high", "medium", "low"]
 STATE_GROUP_ORDER = ["started", "unstarted", "backlog", "completed", "cancelled"]
 CLOSED_GROUPS = {"completed", "cancelled"}
-BOT_COMMANDS = [{"command": "mytask", "description": "Мои задачи по статусам"}]
+BOT_COMMANDS = [{"command": "mytask", "description": "Мои задачи по статусам"},
+                {"command": "task", "description": "Карточка задачи: /task PR-7"}]
 HELP_TEXT = (
     "/mytask — мои активные задачи по статусам\n"
-    "/mytask all — вместе с Done и Cancelled\n\n"
+    "/mytask all — вместе с Done и Cancelled\n"
+    "/task PR-7 — полная карточка задачи с комментариями\n\n"
     "Уведомления об изменениях в ваших задачах приходят сами. "
     "Бот проверяет Plane раз в 30 минут."
 )
 TG_LIMIT = 4000
+LIST_DESCRIPTION_LIMIT = 150
+CARD_DESCRIPTION_LIMIT = 3000
+CARD_COMMENTS = 5
 
 
 def http_json(method, url, headers=None, body=None):
@@ -257,6 +262,20 @@ def fmt_date(value):
         return ""
 
 
+def ago(value):
+    """«2 ч назад» по ISO-времени Plane."""
+    try:
+        moment = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    minutes = int((datetime.datetime.now(datetime.timezone.utc) - moment).total_seconds() // 60)
+    if minutes < 60:
+        return f"{max(minutes, 1)} мин назад"
+    if minutes < 60 * 24:
+        return f"{minutes // 60} ч назад"
+    return f"{minutes // (60 * 24)} дн назад"
+
+
 def clean_text(stripped, raw_html, limit):
     text = stripped or ""
     if not text:
@@ -277,7 +296,7 @@ def issue_link(issue, project):
     return key, f"{PLANE_URL}/{WORKSPACE}/projects/{project['id']}/issues/{issue['id']}"
 
 
-def issue_message(issue, project, states, was, title="", extra=()):
+def issue_message(issue, project, states, was, title="", extra=(), limit=DESCRIPTION_LIMIT, footer=()):
     e = html.escape
     pid = project["id"]
     key, link = issue_link(issue, project)
@@ -309,11 +328,15 @@ def issue_message(issue, project, states, was, title="", extra=()):
     author = person_name(issue.get("created_by"))
     if author:
         lines.append(f"✍️ Автор: {e(author)}")
+    if issue.get("updated_at"):
+        lines.append(f"🕓 Обновлена: {ago(issue['updated_at'])}")
     if extra:
         lines += ["", *extra]
-    description = description_text(issue)
+    description = description_text(issue, limit)
     if description:
         lines += ["", f"📝 {e(description)}"]
+    if footer:
+        lines += ["", *footer]
     lines += ["", f"🔗 <a href=\"{e(link)}\">Открыть в Plane</a>"]
     return "\n".join(lines)
 
@@ -388,15 +411,15 @@ def issue_changes(old, new, states, project_id):
     return out
 
 
-def comment_lines(comments):
+def comment_lines(comments, shown=COMMENTS_SHOWN):
     e = html.escape
     lines = []
-    for c in comments[:COMMENTS_SHOWN]:
+    for c in comments[:shown]:
         name = person_name(user_id(c.get("actor"))) or (c.get("actor_detail") or {}).get("display_name", "")
         text = clean_text(c.get("comment_stripped"), c.get("comment_html"), COMMENT_LIMIT)
         lines.append(f"💬 <b>{e(name or 'Комментарий')}</b>: {e(text)}")
-    if len(comments) > COMMENTS_SHOWN:
-        lines.append(f"💬 …и ещё {len(comments) - COMMENTS_SHOWN}")
+    if len(comments) > shown:
+        lines.append(f"💬 …и ещё {len(comments) - shown}")
     return lines
 
 
@@ -457,20 +480,31 @@ def tasks_message(mine, show_all):
         if group in CLOSED_GROUPS and not show_all:
             hidden.append(f"{name}: {len(items)}")
             continue
-        lines += ["", f"<b>{e(name)}</b> ({len(items)})"]
+        lines += ["", f"━━ <b>{e(name)}</b> ({len(items)})"]
         for issue, project in sorted(items, key=issue_rank):
-            key = f"{project.get('identifier', '')}-{issue.get('sequence_id', '')}"
-            link = f"{PLANE_URL}/{WORKSPACE}/projects/{project['id']}/issues/{issue['id']}"
+            key, link = issue_link(issue, project)
             title = issue.get("name", "")
             if len(title) > 80:
                 title = title[:80].rsplit(" ", 1)[0] + "…"
             icon = PRIORITIES.get(issue.get("priority"), "⚪️").split()[0]
-            line = f"{icon} <a href=\"{e(link)}\">{e(key)}</a> {e(title)}"
-            due = fmt_date(issue.get("target_date"))
+            lines += ["", f"{icon} <a href=\"{e(link)}\">{e(key)}</a> <b>{e(title)}</b>"]
+            meta = [f"📁 {e(project.get('name', ''))}"]
+            start, due = fmt_date(issue.get("start_date")), fmt_date(issue.get("target_date"))
             if due:
                 overdue = group not in CLOSED_GROUPS and str(issue["target_date"])[:10] < today
-                line += f" · до {due}" + (" ⚠️" if overdue else "")
-            lines.append(line)
+                meta.append(f"📅 {start + ' → ' if start else 'до '}{due}" + (" ⚠️ просрочена" if overdue else ""))
+            elif start:
+                meta.append(f"📅 с {start}")
+            labels = label_names(issue, project["id"])
+            if labels:
+                meta.append(f"🏷 {e(', '.join(labels))}")
+            if issue.get("updated_at"):
+                meta.append(f"🕓 {ago(issue['updated_at'])}")
+            lines.append("    " + " · ".join(meta))
+            description = description_text(issue, LIST_DESCRIPTION_LIMIT)
+            if description:
+                lines.append(f"    <i>{e(description.replace(chr(10), ' '))}</i>")
+            lines.append(f"    подробнее: /task_{re.sub(r'[^A-Za-z0-9]', '_', key)}")
     if not mine:
         lines.append("\nНа вас нет задач.")
     if hidden:
@@ -478,9 +512,46 @@ def tasks_message(mine, show_all):
     return "\n".join(lines)
 
 
-def answer_command(command, args, mine):
+def find_issue(key):
+    """Задача по ключу вида PR-7: (задача, проект, статусы) или None."""
+    m = re.fullmatch(r"([a-z0-9]+)[-_](\d+)", key.lower())
+    if not m:
+        return None
+    identifier, sequence = m.group(1), int(m.group(2))
+    for project in plane_list(f"workspaces/{WORKSPACE}/projects/"):
+        if str(project.get("identifier", "")).lower() != identifier:
+            continue
+        base = f"workspaces/{WORKSPACE}/projects/{project['id']}"
+        for issue in plane_list(f"{base}/issues/"):
+            if issue.get("sequence_id") == sequence:
+                return issue, project, {s["id"]: s for s in plane_list(f"{base}/states/")}
+    return None
+
+
+def task_card(key):
+    found = find_issue(key)
+    if not found:
+        return f"Задача {html.escape(key.upper())} не найдена. Пример: /task PR-7"
+    issue, project, states = found
+    try:
+        comments = sorted(plane_list(f"workspaces/{WORKSPACE}/projects/{project['id']}/issues/"
+                                     f"{issue['id']}/comments/"),
+                          key=lambda c: c.get("created_at") or "")
+    except urllib.error.HTTPError:
+        comments = []
+    footer = (["<b>Последние комментарии:</b>", *comment_lines(comments[::-1], CARD_COMMENTS)]
+              if comments else ["💬 Комментариев нет"])
+    return issue_message(issue, project, states, None, limit=CARD_DESCRIPTION_LIMIT, footer=footer)
+
+
+def answer_command(command, args, mine=None):
+    """Ответ на команду. mine — уже собранные задачи на мне, если есть (иначе запросим)."""
     if command == "/mytask":
-        send_long(tasks_message(mine, "all" in args))
+        send_long(tasks_message(my_tasks() if mine is None else mine, "all" in args))
+    elif command == "/task" and args:
+        send_long(task_card(args[0]))
+    elif command.startswith("/task_"):  # кликабельная ссылка из /mytask: /task_PR_7
+        send_long(task_card(command[len("/task_"):]))
     else:
         send_telegram(HELP_TEXT)
 
