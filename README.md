@@ -1,7 +1,8 @@
-# Plane → Telegram
+# Plane_Task_Tg
 
+Plane → Telegram. 
 Сообщение в Telegram, когда задача в Plane, назначенная на вас, переходит в статус «В работе».
-Работает в GitHub Actions по расписанию (раз в 10 минут), статусы между запусками хранятся в кэше Actions.
+Работает в GitHub Actions по расписанию (раз в 5 минут; GitHub может задерживать запуск), статусы между запусками хранятся в кэше Actions.
 
 ## Настройка
 
@@ -13,8 +14,8 @@ Settings → Secrets and variables → Actions:
 - `TG_CHAT_ID` — ваш Telegram id (узнать: написать @userinfobot)
 
 **Variables**
-- `PLANE_URL` — `https://plane.itcomp.space`
-- `PLANE_WORKSPACE` — `itcomp`
+- `PLANE_URL` — адрес вашего Plane, например `https://plane.example.com`
+- `PLANE_WORKSPACE` — slug воркспейса (часть адреса после домена)
 - `TARGET_STATES` — необязательно; названия статусов через запятую, по умолчанию `In Progress,В работе`
 
 Первый запуск: Actions → «Plane → Telegram» → Run workflow. Придёт сообщение «подключён»,
@@ -23,6 +24,6 @@ Settings → Secrets and variables → Actions:
 ## Локальный запуск
 
 ```bash
-PLANE_URL=https://plane.itcomp.space PLANE_WORKSPACE=itcomp \
+PLANE_URL=https://plane.example.com PLANE_WORKSPACE=my-workspace \
 PLANE_API_KEY=... TG_BOT_TOKEN=... TG_CHAT_ID=... python3 notify.py
 ```
