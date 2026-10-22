@@ -1,0 +1,40 @@
+name: Plane → Telegram
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: plane-notify
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Статусы задач с прошлого запуска
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: plane-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: plane-state-
+
+      - name: Проверить задачи и отправить уведомления
+        run: python3 notify.py
+        env:
+          PLANE_URL: ${{ vars.PLANE_URL }}
+          PLANE_WORKSPACE: ${{ vars.PLANE_WORKSPACE }}
+          TARGET_STATES: ${{ vars.TARGET_STATES }}
+          PLANE_API_KEY: ${{ secrets.PLANE_API_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state
+          key: plane-state-${{ github.run_id }}-${{ github.run_attempt }}
