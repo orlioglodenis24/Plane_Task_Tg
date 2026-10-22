@@ -1,0 +1,6 @@
+{
+  "crons": [{ "path": "/api/cron", "schedule": "*/30 * * * *" }],
+  "functions": {
+    "api/*.py": { "maxDuration": 300, "includeFiles": "notify.py" }
+  }
+}

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Plane → Telegram: сообщает об изменениях в задачах, назначенных на меня.
 
-Запускается по расписанию (GitHub Actions). Между запусками помнит снимок каждой задачи
-в STATE_FILE и шлёт сообщение, если изменились статус, приоритет, сроки, исполнители,
+Запускается по расписанию (Vercel Cron или GitHub Actions). Между запусками помнит снимок
+каждой задачи (в Redis или STATE_FILE) и шлёт сообщение, если изменились статус, приоритет, сроки, исполнители,
 метки, название или описание, появились чужие комментарии или на меня назначили задачу.
-Заодно отвечает на команды боту (/mytask), пришедшие с прошлого запуска.
+На Vercel команды боту (/mytask) приходят вебхуком в api/telegram.py и отвечаются сразу,
+при запуске без Vercel — читаются через getUpdates при очередном запуске.
 
 Переменные окружения:
   PLANE_URL        адрес Plane, например https://plane.example.com
@@ -16,6 +17,9 @@
                    (через запятую, * — любой; по умолчанию «In Progress,В работе»).
                    Остальные изменения приходят коротким сообщением.
   STATE_FILE       файл со снимками задач (по умолчанию state/state.json)
+  KV_REST_API_URL, KV_REST_API_TOKEN
+                   Upstash Redis (Vercel → Storage); если заданы, снимки хранятся там, а не в файле
+  DIGEST           true — каждый запуск присылать сводку «Мои задачи», даже без изменений
   PREVIEW          true — дополнительно прислать пример уведомления по последней обновлённой задаче
 """
 import datetime
@@ -43,6 +47,14 @@ TARGET_STATES = {
 }
 STATE_FILE = os.environ.get("STATE_FILE", "state/state.json")
 PREVIEW = os.environ.get("PREVIEW", "").lower() == "true"
+DIGEST = os.environ.get("DIGEST", "").lower() == "true"
+REDIS_URL = (os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
+REDIS_TOKEN = os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN") or ""
+REDIS_KEY = "plane-tg:state"
+# На Vercel команды приходят вебхуком: адрес и секрет вебхука выводим из окружения и токена бота.
+VERCEL_HOST = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
+WEBHOOK_URL = f"https://{VERCEL_HOST}/api/telegram" if VERCEL_HOST else ""
+WEBHOOK_SECRET = hashlib.sha256(f"webhook:{TG_TOKEN}".encode()).hexdigest()
 DESCRIPTION_LIMIT = 700
 COMMENT_LIMIT = 300
 COMMENTS_SHOWN = 3
@@ -55,7 +67,7 @@ HELP_TEXT = (
     "/mytask — мои активные задачи по статусам\n"
     "/mytask all — вместе с Done и Cancelled\n\n"
     "Уведомления об изменениях в ваших задачах приходят сами. "
-    "Бот проверяет Plane раз в 10 минут, поэтому отвечает не сразу."
+    "Бот проверяет Plane раз в 30 минут."
 )
 TG_LIMIT = 4000
 
@@ -142,16 +154,21 @@ def pending_commands(offset):
     commands = []
     for update in tg_call("getUpdates", **params).get("result", []):
         offset = max(offset or 0, update["update_id"] + 1)
-        msg = update.get("message") or {}
-        if str((msg.get("chat") or {}).get("id")) != str(TG_CHAT_ID):
-            continue  # бота может найти кто угодно — отвечаем только владельцу
-        words = (msg.get("text") or "").split()
-        if words and words[0].startswith("/"):
-            commands.append((words[0].split("@")[0].lower(), [w.lower() for w in words[1:]]))
+        command = parse_command(update)
+        if command:
+            commands.append(command)
     return commands, offset
 
 
+def redis(*command):
+    return http_json("POST", REDIS_URL, {"Authorization": f"Bearer {REDIS_TOKEN}"},
+                     list(command))["result"]
+
+
 def load_state():
+    if REDIS_URL:
+        raw = redis("GET", REDIS_KEY)
+        return json.loads(raw) if raw else None
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             return json.load(f)
@@ -160,6 +177,9 @@ def load_state():
 
 
 def save_state(state):
+    if REDIS_URL:
+        redis("SET", REDIS_KEY, json.dumps(state, ensure_ascii=False))
+        return
     os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
@@ -458,21 +478,50 @@ def tasks_message(mine, show_all):
     return "\n".join(lines)
 
 
-def answer_commands(state, mine):
-    """Ответить на команды боту. Возвращает число отвеченных команд."""
+def answer_command(command, args, mine):
+    if command == "/mytask":
+        send_long(tasks_message(mine, "all" in args))
+    else:
+        send_telegram(HELP_TEXT)
+
+
+def parse_command(update):
+    """(команда, аргументы) из сообщения владельца, иначе None."""
+    msg = update.get("message") or {}
+    if str((msg.get("chat") or {}).get("id")) != str(TG_CHAT_ID):
+        return None  # бота может найти кто угодно — отвечаем только владельцу
+    words = (msg.get("text") or "").split()
+    if words and words[0].startswith("/"):
+        return words[0].split("@")[0].lower(), [w.lower() for w in words[1:]]
+    return None
+
+
+def setup_bot(state):
+    """Меню команд и вебхук — только когда они поменялись."""
     if state.get("bot_commands") != BOT_COMMANDS:
         try:
             tg_call("setMyCommands", commands=BOT_COMMANDS)
             state["bot_commands"] = BOT_COMMANDS
         except Exception as e:
             print(f"не удалось задать меню команд: {type(e).__name__}")
+    if WEBHOOK_URL and state.get("webhook") != WEBHOOK_URL:
+        try:
+            tg_call("setWebhook", url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET,
+                    allowed_updates=["message"])
+            state["webhook"] = WEBHOOK_URL
+        except Exception as e:
+            print(f"не удалось включить вебхук: {type(e).__name__}")
+
+
+def answer_commands(state, mine):
+    """Ответить на команды, накопившиеся с прошлого запуска. Возвращает число отвеченных команд."""
+    setup_bot(state)
+    if state.get("webhook"):
+        return 0  # команды приходят вебхуком, getUpdates при включённом вебхуке не работает
     try:
         commands, offset = pending_commands(state.get("tg_offset"))
         for command, args in commands:
-            if command == "/mytask":
-                send_long(tasks_message(mine, "all" in args))
-            else:
-                send_telegram(HELP_TEXT)
+            answer_command(command, args, mine)
     except Exception as e:  # offset не сдвигаем — ответим в следующий раз
         print(f"не удалось ответить на команды: {type(e).__name__}")
         return 0
@@ -480,7 +529,25 @@ def answer_commands(state, mine):
     return len(commands)
 
 
+def my_tasks():
+    """Задачи на мне: [(задача, проект, статусы проекта)] — для /mytask из вебхука."""
+    me = my_user_id()
+    mine = []
+    for project in plane_list(f"workspaces/{WORKSPACE}/projects/"):
+        if project.get("archived_at"):
+            continue
+        base = f"workspaces/{WORKSPACE}/projects/{project['id']}"
+        try:
+            states = {s["id"]: s for s in plane_list(f"{base}/states/")}
+            issues = plane_list(f"{base}/issues/")
+        except urllib.error.HTTPError:
+            continue
+        mine += [(i, project, states) for i in issues if me in assignee_ids(i)]
+    return mine
+
+
 def main():
+    """Один проход. Возвращает число неотправленных уведомлений."""
     me = my_user_id()
     old_state = load_state()
     first_run = old_state is None
@@ -546,6 +613,12 @@ def main():
         )
         print("статусы в проектах:", ", ".join(sorted(found_state_names)))
 
+    if DIGEST and not first_run:
+        try:
+            send_long(tasks_message(mine, False))
+        except Exception as e:
+            print(f"не удалось отправить сводку: {type(e).__name__}")
+
     if PREVIEW and mine:
         issue, project, states = max(mine, key=lambda m: m[0].get("updated_at") or "")
         send_telegram(issue_message(issue, project, states, None, "👀 <i>Пример уведомления</i>"))
@@ -557,9 +630,8 @@ def main():
     print(f"задач на мне: {len(current)}, уведомлений: {len(events) - failed_sends}, "
           f"ошибок отправки: {failed_sends}, пропущено проектов: {failed_projects}, "
           f"команд: {answered}")
-    if failed_sends:
-        sys.exit(1)
+    return failed_sends
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(1 if main() else 0)
